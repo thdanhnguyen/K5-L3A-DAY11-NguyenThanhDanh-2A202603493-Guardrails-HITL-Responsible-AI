@@ -4,6 +4,8 @@ Checkpoint 2 — Output Guardrails
   - OutputGuardrailPlugin (ADK)           ← bắt buộc
   - LLM-as-Judge                          ← optional (không chấm)
 """
+import base64
+import codecs
 import re
 import textwrap
 
@@ -12,6 +14,7 @@ from google.adk.agents import llm_agent
 from google.adk import runners
 from google.adk.plugins import base_plugin
 
+from core.config import DEMO_SECRETS
 from core.utils import chat_with_agent
 
 
@@ -39,14 +42,14 @@ def content_filter(response: str) -> dict:
     issues = []
     redacted = response
 
-    # PII patterns to check
+    # PII and secret patterns to check
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        "national_id": r"\b(?:\d{12}|\d{9})\b",
+        "phone": r"\b0\d{9,10}\b",
+        "email": r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}",
+        "api_key": r"\bsk-[a-zA-Z0-9-]+\b",
+        "password": r"\bpassword\s*(?:[:=]|is)\s*[^\s,;.]+",
+        "internal_host": r"\bdb\.vinbank\.internal(?::\d+)?\b",
     }
 
     for name, pattern in PII_PATTERNS.items():
@@ -54,6 +57,26 @@ def content_filter(response: str) -> dict:
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+
+    # Also detect encoded/obfuscated forms (hex, base64, ROT13, reversed) of DEMO_SECRETS
+    encoded_found = 0
+    for secret in DEMO_SECRETS:
+        if not secret or len(secret) < 6:
+            continue
+        variants = {
+            secret.encode("utf-8").hex(),
+            base64.b64encode(secret.encode("utf-8")).decode("ascii"),
+            codecs.encode(secret, "rot_13"),
+            secret[::-1],
+        }
+        for variant in variants:
+            if variant and variant.lower() in redacted.lower():
+                encoded_found += 1
+                redacted = re.sub(
+                    re.escape(variant), "[REDACTED]", redacted, flags=re.IGNORECASE
+                )
+    if encoded_found:
+        issues.append(f"encoded_secret: {encoded_found} found")
 
     return {
         "safe": len(issues) == 0,
@@ -172,16 +195,35 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        # 1. Check PII / secrets via content_filter
+        filter_result = content_filter(response_text)
+        if not filter_result["safe"]:
+            self.redacted_count += 1
+            response_text = filter_result["redacted"]
+            llm_response.content = types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=response_text)],
+            )
 
-        return llm_response  # TODO: modify if needed
+        # 2. Optional LLM-as-Judge safety check
+        if self.use_llm_judge:
+            judge_result = await llm_safety_check(response_text)
+            if not judge_result["safe"]:
+                self.blocked_count += 1
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[
+                        types.Part.from_text(
+                            text=(
+                                "Response blocked by VinBank safety policy. "
+                                "How else can I assist you with your banking needs?"
+                            )
+                        )
+                    ],
+                )
+
+        # 3. Return llm_response (possibly modified)
+        return llm_response
 
 
 # ============================================================
